@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/aws/aws-xray-sdk-go/xray"
 	"github.com/opentffoundation/registry/internal/github"
@@ -27,14 +28,18 @@ func GetVersions(ctx context.Context, ghClient *githubv4.Client, namespace strin
 		Err     error
 	}
 
+	overallStart := time.Now()
 	err = xray.Capture(ctx, "provider.versions", func(tracedCtx context.Context) error {
+		fmt.Printf("Fetching versions for %s/%s\n", namespace, name)
 		xray.AddAnnotation(tracedCtx, "namespace", namespace)
 		xray.AddAnnotation(tracedCtx, "name", name)
 
+		fmt.Printf("Fetching releases for %s/%s\n", namespace, name)
 		releases, releasesErr := github.FetchReleases(tracedCtx, ghClient, namespace, name)
 		if releasesErr != nil {
 			return fmt.Errorf("failed to fetch releases: %w", releasesErr)
 		}
+		fmt.Printf("Found %d releases. Time taken: %s\n", len(releases), time.Since(overallStart))
 
 		versionCh := make(chan versionResult, len(releases))
 
@@ -43,10 +48,15 @@ func GetVersions(ctx context.Context, ghClient *githubv4.Client, namespace strin
 		for _, release := range releases {
 			wg.Add(1)
 			go func(r github.GHRelease) {
+
+				// start time
+				startTime := time.Now()
+				fmt.Printf("[%s] Processing release\n", r.TagName)
 				defer wg.Done()
 				result := versionResult{}
 
 				assets := r.ReleaseAssets.Nodes
+				fmt.Printf("[%s] Identifying supported platforms\n", r.TagName)
 				platforms, platformsErr := getSupportedArchAndOS(assets)
 				if platformsErr != nil {
 					result.Err = fmt.Errorf("failed to get supported platforms: %w", platformsErr)
@@ -56,11 +66,12 @@ func GetVersions(ctx context.Context, ghClient *githubv4.Client, namespace strin
 
 				// if there are no platforms, we can't do anything with this release
 				// so, we should just skip
-
 				if len(platforms) == 0 {
+					fmt.Printf("[%s] No supported platforms found. Time Taken: %s\n", r.TagName, time.Since(startTime))
 					return
 				}
 
+				fmt.Printf("[%s] Finding and parsing manifest\n", r.TagName)
 				manifest, manifestErr := findAndParseManifest(tracedCtx, assets)
 				if manifestErr != nil {
 					result.Err = fmt.Errorf("failed to find and parse manifest: %w", manifestErr)
@@ -79,6 +90,7 @@ func GetVersions(ctx context.Context, ghClient *githubv4.Client, namespace strin
 					result.Version.Protocols = []string{"5.0"}
 				}
 
+				fmt.Printf("[%s] Found %d platforms. Time taken: %s\n", r.TagName, len(platforms), time.Since(startTime))
 				versionCh <- result
 			}(release)
 		}
@@ -99,6 +111,8 @@ func GetVersions(ctx context.Context, ghClient *githubv4.Client, namespace strin
 
 		return nil
 	})
+
+	fmt.Printf("Found %d versions\n", len(versions))
 
 	return
 }
